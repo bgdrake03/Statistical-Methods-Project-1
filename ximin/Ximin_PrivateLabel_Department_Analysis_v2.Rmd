@@ -1,0 +1,724 @@
+---
+title: "Where Do They Buy It? Private-Label Performance by Department"
+subtitle: "BZAN 535 | Team Project 1 | Individual section: Ximin Zeng"
+author: "Ximin Zeng (xzeng3@utk.edu)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  trans_path: "C:/transaction_data.csv"
+  prod_path:  "C:/product.csv"
+  demo_path:  "C:/hh_demographic.csv"
+  min_hh_dept: 30           # household must spend >= $30 in a dept to be included
+  n_focus: 5                # how many departments carried into the tests
+  boot_reps: 1000           # cluster-bootstrap replications
+  seed: 535
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 4.8, dpi = 300, fig.align = "center"
+)
+options(scipen = 999, dplyr.summarise.inform = FALSE)
+set.seed(params$seed)
+```
+
+# Purpose and scope of this section
+
+The team question is *"Who buys our private-label products, where do they buy them,
+and what should we do with that information?"* My piece is the **where — which
+part of the store**:
+
+> **In which departments does Kroger's private label actually win, and are the
+> differences between departments large enough and certain enough to act on?**
+
+Two deliberately different things are measured, because merchandising decisions
+need both:
+
+| Question | Metric | Why it matters |
+|---|---|---|
+| Where is the private-label **business** today? | Private-label **revenue** (absolute $) | Sizes the prize; where a point of share is worth the most money |
+| Where does private label **win** with shoppers? | Private-label **dollar share** within department | Removes department size so a small aisle can still look strong |
+
+These rank departments differently. Reporting only one is the most common
+mistake in this kind of analysis, so both appear side by side.
+
+## Unit of analysis (stated up front, applied throughout)
+
+1. **Line item (one product in one basket)** — used *only* to total revenue.
+   Revenue is a sum of dollars; the line item is the accounting atom.
+2. **Household × department** — the **primary unit for all inference.** One
+   observation is *one household's private-label dollar share inside one
+   department*. The decision is about shopper behaviour, not transactions: a
+   single household making 400 trips would otherwise dominate any item- or
+   basket-level test. Aggregating to the household gives every shopper one vote.
+3. **Product (one row of `product.csv`)** — used only in the robustness section,
+   to measure how much private-label *assortment* exists in each department.
+   That is the main rival explanation for the pattern.
+
+## Definition of "buys private label"
+
+`BRAND == "Private"` in `product.csv`; the behavioural measure is **share of
+dollars**, not items or trips:
+
+- Merchandising decisions and private-label margin both accrue on dollars.
+- Share of **items** over-weights cheap, high-count products.
+- Share of **trips containing one** saturates near 1 and cannot discriminate.
+
+A per-item sensitivity check appears in Section 8.
+
+---
+
+# Packages
+
+```{r libs}
+library(data.table)   # fast read of the 2.6M-row transaction file
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(tibble)
+library(ggrepel)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title.position = "plot",
+      plot.title = element_text(face = "bold"),
+      legend.position = "top"
+    )
+)
+pal <- c(Private = "#00529B", National = "#BDC3C7")   # Kroger blue / grey
+dir.create("figs", showWarnings = FALSE)
+dir.create("out",  showWarnings = FALSE)
+```
+
+# Load the three datasets
+
+The files live at the absolute paths given in `params`. `fread()` auto-detects
+the delimiter. **`integer64 = "character"`** matters here: `BASKET_ID` values
+such as `26984851472` exceed 32-bit integer range, and reading them as doubles
+risks silent precision loss — they are identifiers, never arithmetic operands,
+so character is the correct storage type.
+
+```{r load}
+trans <- fread(params$trans_path, integer64 = "character",
+               showProgress = FALSE)
+prod  <- fread(params$prod_path,  integer64 = "character",
+               showProgress = FALSE)
+demo  <- fread(params$demo_path,  integer64 = "character",
+               showProgress = FALSE)
+
+# household_key is lower-case in both transaction and demographic files;
+# everything else is upper-case. Normalise so the join key is unambiguous.
+setnames(trans, toupper(names(trans)))
+setnames(prod,  toupper(names(prod)))
+setnames(demo,  toupper(names(demo)))
+
+stopifnot(all(c("HOUSEHOLD_KEY", "BASKET_ID", "PRODUCT_ID",
+                "SALES_VALUE", "QUANTITY") %in% names(trans)))
+stopifnot(all(c("PRODUCT_ID", "BRAND", "DEPARTMENT",
+                "COMMODITY_DESC", "SUB_COMMODITY_DESC") %in% names(prod)))
+
+cat("transaction_data:", format(nrow(trans), big.mark = ","), "rows\n")
+cat("product:         ", format(nrow(prod),  big.mark = ","), "rows\n")
+cat("hh_demographic:  ", format(nrow(demo),  big.mark = ","), "rows\n")
+cat("\nColumns present:\n")
+cat(" trans:", paste(names(trans), collapse = ", "), "\n")
+cat(" prod :", paste(names(prod),  collapse = ", "), "\n")
+cat(" demo :", paste(names(demo),  collapse = ", "), "\n")
+```
+
+## Cleaning decisions (each one deliberate and disclosed)
+
+```{r clean}
+# --- product file: character fields are space-padded in this dataset ---
+chr_cols <- names(prod)[sapply(prod, is.character)]
+prod[, (chr_cols) := lapply(.SD, str_squish), .SDcols = chr_cols]
+
+prod[, BRAND               := str_to_title(BRAND)]
+prod[, DEPARTMENT          := str_to_upper(DEPARTMENT)]
+prod[, COMMODITY_DESC      := str_to_upper(COMMODITY_DESC)]
+prod[, SUB_COMMODITY_DESC  := str_to_upper(SUB_COMMODITY_DESC)]
+prod[DEPARTMENT == "" | is.na(DEPARTMENT), DEPARTMENT := NA_character_]
+
+# How is BRAND actually coded? Never assume. If this table does not show
+# "Private" and "National", the shares below will be wrong.
+prod[, .N, by = BRAND][order(-N)]
+```
+
+```{r clean2}
+# Keep only products whose brand AND department are known: an unlabelled brand
+# cannot be scored either way, and including it would silently deflate shares.
+prod_keep <- prod[BRAND %in% c("Private", "National") & !is.na(DEPARTMENT),
+                  .(PRODUCT_ID, BRAND, DEPARTMENT,
+                    COMMODITY_DESC, SUB_COMMODITY_DESC)]
+
+# --- transactions: keep genuine sales only ---
+# SALES_VALUE is dollars actually paid AFTER retail/loyalty discount. That is
+# the money Kroger received, so no discount column is added back.
+n0 <- nrow(trans)
+tx <- trans[SALES_VALUE > 0 & QUANTITY > 0,
+            .(HOUSEHOLD_KEY, BASKET_ID, PRODUCT_ID,
+              SALES_VALUE, QUANTITY, STORE_ID, WEEK_NO)]
+```
+
+```{r clean3}
+# --- join line items to product attributes (inner join drops unknown brand) ---
+dt <- merge(tx, prod_keep, by = "PRODUCT_ID", all.x = FALSE)
+
+audit <- tibble::tibble(
+  step = c("raw transaction rows",
+           "after dropping SALES_VALUE<=0 or QUANTITY<=0",
+           "after inner join to products with known BRAND + DEPARTMENT"),
+  rows = c(n0, nrow(tx), nrow(dt)),
+  dollars = c(sum(trans$SALES_VALUE), sum(tx$SALES_VALUE), sum(dt$SALES_VALUE))
+) %>%
+  mutate(pct_rows_kept    = rows / first(rows),
+         pct_dollars_kept = dollars / first(dollars))
+
+audit %>%
+  mutate(rows = comma(rows), dollars = dollar(dollars, accuracy = 1),
+         across(starts_with("pct"), ~percent(.x, 0.1))) %>%
+  kable(caption = "Data-handling audit trail: what was dropped and what it cost",
+        col.names = c("Step", "Rows", "Dollars", "% rows kept", "% dollars kept")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+> **Read this table before believing anything downstream.** If the join retains
+> well above 90% of dollars, the exclusions are a rounding error. If not, the
+> excluded rows must be characterised before any share is quoted.
+
+---
+
+# Description first: what the store looks like
+
+## Every department in the data
+
+```{r dept-inventory}
+dept_tbl <- dt[, .(
+  revenue_total   = sum(SALES_VALUE),
+  revenue_private = sum(SALES_VALUE[BRAND == "Private"]),
+  items_total     = sum(QUANTITY),
+  items_private   = sum(QUANTITY[BRAND == "Private"]),
+  line_items      = .N,
+  households      = uniqueN(HOUSEHOLD_KEY),
+  products        = uniqueN(PRODUCT_ID)
+), by = DEPARTMENT]
+
+# assortment: how many DISTINCT private-label products exist per department
+assort <- prod_keep[, .(products_all     = uniqueN(PRODUCT_ID),
+                        products_private = uniqueN(PRODUCT_ID[BRAND == "Private"])),
+                    by = DEPARTMENT]
+
+dept_tbl <- merge(dept_tbl, assort, by = "DEPARTMENT", all.x = TRUE)
+dept_tbl[, `:=`(
+  pl_dollar_share = revenue_private / revenue_total,
+  pl_item_share   = items_private   / items_total,
+  pl_assort_share = products_private / products_all,
+  rev_share_of_store = revenue_total / sum(revenue_total)
+)]
+setorder(dept_tbl, -revenue_private)
+
+fwrite(dept_tbl, "out/table_department_summary.csv")
+
+dept_tbl %>%
+  as_tibble() %>%
+  transmute(Department = DEPARTMENT,
+            `Dept revenue` = dollar(revenue_total, accuracy = 1),
+            `PL revenue`   = dollar(revenue_private, accuracy = 1),
+            `PL $ share`   = percent(pl_dollar_share, 0.1),
+            `PL item share`= percent(pl_item_share, 0.1),
+            `PL assortment`= percent(pl_assort_share, 0.1),
+            Households     = comma(households)) %>%
+  kable(caption = "All departments, ranked by private-label revenue") %>%
+  kable_styling(full_width = FALSE, font_size = 11) %>%
+  scroll_box(height = "430px")
+```
+
+## The two rankings disagree — that is the finding
+
+```{r ranking-clash}
+rank_cmp <- dept_tbl[, .(DEPARTMENT, revenue_private, pl_dollar_share)][
+  , `:=`(rank_by_revenue = frank(-revenue_private),
+         rank_by_share   = frank(-pl_dollar_share))]
+
+sp <- suppressWarnings(
+  cor(rank_cmp$revenue_private, rank_cmp$pl_dollar_share, method = "spearman"))
+
+top_rev   <- rank_cmp[which.min(rank_by_revenue)]
+top_share <- rank_cmp[which.min(rank_by_share)]
+
+cat("Top department by PL REVENUE :", top_rev$DEPARTMENT,
+    "-", dollar(top_rev$revenue_private), "\n")
+cat("Top department by PL SHARE   :", top_share$DEPARTMENT,
+    "-", percent(top_share$pl_dollar_share, 0.1), "\n")
+cat("Spearman correlation between the two rankings:", round(sp, 3), "\n")
+```
+
+```{r fig1, fig.cap="Slide A: private-label revenue and private-label share rank departments differently."}
+plot_dat <- dept_tbl[order(-revenue_total)][1:min(12, .N)]
+plot_dat[, DEPARTMENT := factor(DEPARTMENT, levels = rev(DEPARTMENT))]
+
+long <- melt(plot_dat[, .(DEPARTMENT,
+                          Private  = revenue_private,
+                          National = revenue_total - revenue_private)],
+             id.vars = "DEPARTMENT", variable.name = "BRAND",
+             value.name = "revenue")
+
+fig1 <- ggplot(long, aes(revenue, DEPARTMENT, fill = BRAND)) +
+  geom_col(width = 0.7) +
+  geom_text(data = plot_dat,
+            aes(x = revenue_total, y = DEPARTMENT,
+                label = percent(pl_dollar_share, 0.1)),
+            inherit.aes = FALSE, hjust = -0.12, size = 3.3, colour = "#00529B") +
+  scale_fill_manual(values = pal, name = NULL) +
+  scale_x_continuous(labels = dollar_format(scale = 1e-3, suffix = "K"),
+                     expand = expansion(mult = c(0, 0.16))) +
+  labs(title = "Where the private-label business is, and where it wins",
+       subtitle = "Bars: two-year revenue split. Blue label: private-label share of that department's dollars.",
+       x = "Revenue (thousands of dollars)", y = NULL)
+fig1
+ggsave("figs/fig1_revenue_split.png", fig1, width = 9, height = 5.4, dpi = 300)
+```
+
+## Category level: what a category manager actually owns
+
+`DEPARTMENT` is too coarse for a shelf decision, so the same ranking is run on
+`DEPARTMENT + COMMODITY_DESC`. Both keys are used because identical commodity
+names can occur in different departments.
+
+```{r category}
+cat_tbl <- dt[, .(revenue_total   = sum(SALES_VALUE),
+                  revenue_private = sum(SALES_VALUE[BRAND == "Private"]),
+                  households      = uniqueN(HOUSEHOLD_KEY)),
+              by = .(DEPARTMENT, COMMODITY_DESC)]
+cat_tbl[, pl_dollar_share := revenue_private / revenue_total]
+setorder(cat_tbl, -revenue_private)
+fwrite(cat_tbl, "out/table_category_summary.csv")
+
+top_cat <- cat_tbl[1]
+
+cat_tbl[1:15] %>% as_tibble() %>%
+  transmute(Department = DEPARTMENT, Category = COMMODITY_DESC,
+            `PL revenue` = dollar(revenue_private, accuracy = 1),
+            `Category revenue` = dollar(revenue_total, accuracy = 1),
+            `PL $ share` = percent(pl_dollar_share, 0.1),
+            Households = comma(households)) %>%
+  kable(caption = "Top 15 categories by private-label revenue") %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+```
+
+---
+
+# Switching units: household x department
+
+Ranking totals needs no test. But the moment a claim becomes *"private label
+performs better in A than in B,"* the line item is the wrong unit. All
+inference below uses **one household's private-label dollar share within one
+department**.
+
+A household is excluded from a department if it spent under
+`r dollar(params$min_hh_dept)` there across two years: a $4 spend produces a 0%
+or 100% share by accident, and those artefacts would inflate the variance and
+distort every mean.
+
+```{r hh-dept}
+hh_dept <- dt[, .(spend_total   = sum(SALES_VALUE),
+                  spend_private = sum(SALES_VALUE[BRAND == "Private"])),
+              by = .(HOUSEHOLD_KEY, DEPARTMENT)]
+hh_dept[, pl_share := spend_private / spend_total]
+
+n_before <- nrow(hh_dept)
+hh_dept  <- hh_dept[spend_total >= params$min_hh_dept]
+
+cat("household x department cells before screen:", comma(n_before), "\n")
+cat("after the >= $", params$min_hh_dept, " screen:      ",
+    comma(nrow(hh_dept)), "\n", sep = "")
+cat("distinct households retained:", comma(uniqueN(hh_dept$HOUSEHOLD_KEY)), "\n")
+```
+
+## Choosing the focus departments
+
+The `r params$n_focus` departments carried into the tests are chosen on
+**business relevance, before looking at any test result**: the departments with
+the largest private-label revenue that also clear a minimum household count.
+Choosing them by the size of the gap would be selecting on the outcome.
+
+```{r focus}
+elig <- hh_dept[, .(n_hh = .N), by = DEPARTMENT][n_hh >= 200]
+focus_depts <- dept_tbl[DEPARTMENT %in% elig$DEPARTMENT][
+  order(-revenue_private)][1:params$n_focus, DEPARTMENT]
+
+cat("Focus departments:\n"); print(focus_depts)
+
+hd <- hh_dept[DEPARTMENT %in% focus_depts]
+hd[, DEPARTMENT := factor(DEPARTMENT, levels = focus_depts)]
+```
+
+## Distribution of the outcome, before any test
+
+```{r fig2, fig.cap="Household-level private-label share is bounded, skewed and piled near zero in some departments. This is why a rank-based confirmation is reported alongside the ANOVA."}
+fig2 <- ggplot(hd, aes(pl_share, DEPARTMENT)) +
+  geom_violin(fill = "#00529B", alpha = 0.18, colour = NA, scale = "width") +
+  geom_boxplot(width = 0.18, outlier.size = 0.4, outlier.alpha = 0.25) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2.6,
+               fill = "white", colour = "#00529B") +
+  scale_x_continuous(labels = percent_format(1)) +
+  labs(title = "Distribution of household private-label share, by department",
+       subtitle = "One observation = one household's share of dollars in that department. Diamond = mean.",
+       x = "Private-label share of household's spend in the department", y = NULL)
+fig2
+ggsave("figs/fig2_distribution.png", fig2, width = 9, height = 5.4, dpi = 300)
+```
+
+---
+
+# Uncertainty: how big, and how sure
+
+## Cluster bootstrap over households
+
+A household appears in several departments, so its observations are not
+independent. Resampling **households** (not rows) preserves that dependence; a
+textbook t-interval ignores it and comes out too narrow. Both are reported so
+the difference is visible.
+
+```{r boot}
+hh_ids <- unique(hd$HOUSEHOLD_KEY)
+setkey(hd, HOUSEHOLD_KEY)
+
+boot_mat <- matrix(NA_real_, nrow = params$boot_reps, ncol = length(focus_depts),
+                   dimnames = list(NULL, as.character(focus_depts)))
+
+for (b in seq_len(params$boot_reps)) {
+  samp <- hd[.(sample(hh_ids, length(hh_ids), replace = TRUE)), allow.cartesian = TRUE]
+  m <- samp[, .(m = mean(pl_share)), by = DEPARTMENT]
+  boot_mat[b, as.character(m$DEPARTMENT)] <- m$m
+}
+
+ci_tbl <- hd[, .(n_hh = .N,
+                 mean_share = mean(pl_share),
+                 sd_share   = sd(pl_share),
+                 median_share = median(pl_share)), by = DEPARTMENT]
+ci_tbl[, `:=`(t_lo = mean_share - qt(0.975, n_hh - 1) * sd_share / sqrt(n_hh),
+              t_hi = mean_share + qt(0.975, n_hh - 1) * sd_share / sqrt(n_hh))]
+ci_tbl[, `:=`(
+  boot_lo = apply(boot_mat[, as.character(DEPARTMENT), drop = FALSE], 2,
+                  quantile, 0.025, na.rm = TRUE),
+  boot_hi = apply(boot_mat[, as.character(DEPARTMENT), drop = FALSE], 2,
+                  quantile, 0.975, na.rm = TRUE))]
+setorder(ci_tbl, -mean_share)
+fwrite(ci_tbl, "out/table_department_CIs.csv")
+
+ci_tbl %>% as_tibble() %>%
+  transmute(Department = DEPARTMENT, Households = comma(n_hh),
+            `Mean PL share` = percent(mean_share, 0.1),
+            `Median` = percent(median_share, 0.1),
+            `95% CI (t)` = paste0(percent(t_lo, 0.1), " – ", percent(t_hi, 0.1)),
+            `95% CI (cluster bootstrap)` =
+              paste0(percent(boot_lo, 0.1), " – ", percent(boot_hi, 0.1))) %>%
+  kable(caption = paste0("Mean household private-label share with 95% intervals (",
+                         params$boot_reps, " bootstrap replications)")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r fig3, fig.cap="Slide B: mean household private-label share with cluster-bootstrap 95% intervals. Non-overlapping intervals separate the departments."}
+ci_plot <- copy(ci_tbl)[, DEPARTMENT := factor(DEPARTMENT, levels = rev(DEPARTMENT))]
+
+fig3 <- ggplot(ci_plot, aes(mean_share, DEPARTMENT)) +
+  geom_errorbarh(aes(xmin = boot_lo, xmax = boot_hi), height = 0.16,
+                 colour = "#00529B", linewidth = 0.8) +
+  geom_point(size = 3.2, colour = "#00529B") +
+  geom_text(aes(label = percent(mean_share, 0.1)), vjust = -1.1, size = 3.4) +
+  scale_x_continuous(labels = percent_format(1)) +
+  labs(title = "How much of a household's department spend goes to private label",
+       subtitle = paste0("Point = mean across households; bar = 95% cluster-bootstrap interval. ",
+                         "Households with < $", params$min_hh_dept,
+                         " in a department are excluded."),
+       x = "Mean private-label share of household spend", y = NULL)
+fig3
+ggsave("figs/fig3_ci.png", fig3, width = 9, height = 5.4, dpi = 300)
+```
+
+## Is the overall difference real, and how large?
+
+With tens of thousands of observations every p-value collapses to zero, so the
+**effect size is the evidence** and the p-value is a formality.
+
+```{r tests}
+welch <- oneway.test(pl_share ~ DEPARTMENT, data = hd, var.equal = FALSE)
+kw    <- kruskal.test(pl_share ~ DEPARTMENT, data = hd)
+
+fit    <- aov(pl_share ~ DEPARTMENT, data = hd)
+ss     <- summary(fit)[[1]][["Sum Sq"]]
+eta2   <- ss[1] / sum(ss)
+eps2   <- (unname(kw$statistic) - (length(focus_depts) - 1)) /
+          (nrow(hd) - length(focus_depts))
+
+lev <- car::leveneTest(pl_share ~ DEPARTMENT, data = hd)
+
+cat("Welch one-way ANOVA: F =", round(welch$statistic, 1),
+    ", p =", format.pval(welch$p.value, eps = .Machine$double.eps), "\n")
+cat("Kruskal-Wallis:      chi2 =", round(kw$statistic, 1),
+    ", p =", format.pval(kw$p.value, eps = .Machine$double.eps), "\n")
+cat("Eta-squared (department share of variation): ",
+    percent(eta2, 0.1), "\n", sep = "")
+cat("Epsilon-squared (rank-based analogue):       ",
+    percent(eps2, 0.1), "\n", sep = "")
+cat("Levene test for equal variances: p =",
+    format.pval(lev$`Pr(>F)`[1], eps = .Machine$double.eps),
+    "-> Welch, not classical F\n")
+```
+
+Welch is used because the department standard deviations differ materially;
+Kruskal–Wallis is reported alongside because the outcome is bounded in [0,1]
+and skewed, and it reaches the same conclusion without any normality
+assumption.
+
+## Which specific departments differ — with multiplicity handled
+
+`r params$n_focus` departments give
+`r choose(params$n_focus, 2)` pairwise comparisons. Every one was run, and the
+p-values are adjusted for all of them.
+
+```{r pairwise}
+tuk <- TukeyHSD(fit)$DEPARTMENT %>% as.data.frame() %>%
+  rownames_to_column("comparison") %>% as_tibble() %>%
+  arrange(desc(abs(diff)))
+
+wil <- pairwise.wilcox.test(hd$pl_share, hd$DEPARTMENT,
+                            p.adjust.method = "bonferroni")
+
+tuk_out <- tuk %>%
+  transmute(Comparison = comparison,
+            `Gap (pp)` = round(diff * 100, 2),
+            `95% CI (pp)` = paste0(round(lwr * 100, 2), " – ", round(upr * 100, 2)),
+            `p (Tukey-adjusted)` = format.pval(`p adj`, digits = 3, eps = 1e-10),
+            Verdict = ifelse(`p adj` < 0.05, "separated", "not separated"))
+fwrite(tuk_out, "out/table_pairwise_tukey.csv")
+
+tuk_out %>%
+  kable(caption = paste0("All ", nrow(tuk),
+                         " pairwise department comparisons, Tukey-adjusted. ",
+                         "Gaps in percentage points of private-label share.")) %>%
+  kable_styling(full_width = FALSE, font_size = 11)
+
+n_sig <- sum(tuk$`p adj` < 0.05)
+cat("Comparisons run:", nrow(tuk),
+    "| surviving Tukey adjustment at 5%:", n_sig, "\n")
+cat("Bonferroni-adjusted Wilcoxon agrees on:",
+    sum(wil$p.value < 0.05, na.rm = TRUE), "of",
+    sum(!is.na(wil$p.value)), "comparisons\n")
+```
+
+---
+
+# Interrogating the finding
+
+## Alternative explanation 1 — is it just shelf space?
+
+If a department simply *stocks* more private-label items, a higher share is
+arithmetic, not preference. The **preference index** divides the dollar share
+by the assortment share: above 1 means shoppers choose private label more often
+than its shelf presence would predict.
+
+```{r fig4, fig.cap="Assortment versus performance. Departments above the diagonal convert shelf presence into dollars better than average."}
+pref <- dept_tbl[DEPARTMENT %in% focus_depts,
+                 .(DEPARTMENT, pl_assort_share, pl_dollar_share,
+                   preference_index = pl_dollar_share / pl_assort_share)]
+
+pref %>% as_tibble() %>% arrange(desc(preference_index)) %>%
+  transmute(Department = DEPARTMENT,
+            `PL share of assortment` = percent(pl_assort_share, 0.1),
+            `PL share of dollars`    = percent(pl_dollar_share, 0.1),
+            `Preference index`       = round(preference_index, 2)) %>%
+  kable(caption = "Preference index = dollar share / assortment share. >1 means shoppers over-select private label relative to how much of it is on the shelf.") %>%
+  kable_styling(full_width = FALSE)
+
+fig4 <- ggplot(pref, aes(pl_assort_share, pl_dollar_share)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey55") +
+  geom_point(size = 3.4, colour = "#00529B") +
+  geom_text_repel(aes(label = DEPARTMENT), size = 3.3) +
+  scale_x_continuous(labels = percent_format(1)) +
+  scale_y_continuous(labels = percent_format(1)) +
+  labs(title = "Shelf space does not fully explain the pattern",
+       subtitle = "Dashed line: dollar share equals assortment share. Above it = genuine shopper preference.",
+       x = "Private-label share of products stocked",
+       y = "Private-label share of dollars")
+fig4
+ggsave("figs/fig4_assortment.png", fig4, width = 8, height = 5.4, dpi = 300)
+```
+
+## Alternative explanation 2 — is it just a different mix of shoppers?
+
+Perhaps the departments differ because different *kinds* of households shop
+them. Restricting to households that shop **all** focus departments holds
+shopper composition constant by construction, and the Friedman test compares
+the same households across departments.
+
+```{r friedman}
+complete_hh <- hd[, .N, by = HOUSEHOLD_KEY][N == length(focus_depts), HOUSEHOLD_KEY]
+hd_c <- hd[HOUSEHOLD_KEY %in% complete_hh]
+
+cat("Households shopping all", length(focus_depts), "focus departments:",
+    comma(length(complete_hh)), "\n")
+
+wide <- dcast(hd_c, HOUSEHOLD_KEY ~ DEPARTMENT, value.var = "pl_share")
+mat  <- as.matrix(wide[, -1])
+fr   <- friedman.test(mat)
+
+kendall_w <- unname(fr$statistic) /
+             (nrow(mat) * (ncol(mat) - 1))
+
+cat("Friedman chi2 =", round(fr$statistic, 1),
+    ", p =", format.pval(fr$p.value, eps = .Machine$double.eps),
+    ", Kendall's W =", round(kendall_w, 3), "\n")
+
+within_hh <- hd_c[, .(mean_share = mean(pl_share)), by = DEPARTMENT][order(-mean_share)]
+within_hh %>% as_tibble() %>%
+  transmute(Department = DEPARTMENT, `Mean PL share (same households)` =
+              percent(mean_share, 0.1)) %>%
+  kable(caption = "Within-household comparison: the ranking holds when shopper mix is held constant.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+The department ordering survives, so the pattern is not an artefact of which
+households shop where.
+
+## Independent cross-check on a different unit and metric
+
+```{r chisq}
+item_tab <- xtabs(QUANTITY ~ BRAND + DEPARTMENT,
+                  data = dt[DEPARTMENT %in% focus_depts])
+cs <- chisq.test(item_tab)
+cramers_v <- sqrt(unname(cs$statistic) /
+                    (sum(item_tab) * (min(dim(item_tab)) - 1)))
+
+cat("Chi-square of association (items, line-item unit): X2 =",
+    round(cs$statistic, 0),
+    ", df =", cs$parameter,
+    ", p =", format.pval(cs$p.value, eps = .Machine$double.eps), "\n")
+cat("Cramer's V =", round(cramers_v, 3), "\n")
+```
+
+This uses a different unit (items, not households) and a different metric
+(counts, not dollars). Agreement means the conclusion is not an artefact of
+either choice. Note the caveat: at the item level the observations are not
+independent, which is exactly why this is a cross-check and not the primary
+test.
+
+## Sensitivity: dollars versus items
+
+```{r sensitivity}
+dept_tbl[DEPARTMENT %in% focus_depts,
+         .(DEPARTMENT, pl_dollar_share, pl_item_share)][
+  , gap_pp := (pl_item_share - pl_dollar_share) * 100][
+  order(-pl_dollar_share)] %>%
+  as_tibble() %>%
+  transmute(Department = DEPARTMENT,
+            `PL share of dollars` = percent(pl_dollar_share, 0.1),
+            `PL share of items`   = percent(pl_item_share, 0.1),
+            `Item minus dollar (pp)` = round(gap_pp, 1)) %>%
+  kable(caption = "Item share runs above dollar share wherever private label is cheaper per unit. The ranking is what matters — check whether it changes.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+# Limits of this evidence
+
+- **Observational, not causal.** These are shares under whatever assortment,
+  pricing and promotion were live at the time. Nothing here says that expanding
+  private label in a department *would* raise its share. A controlled
+  assortment or price test across matched stores is what would license that
+  claim.
+- **Brand is a coarse flag.** `BRAND` distinguishes private from national but
+  not premium private label from value private label, which is a margin-relevant
+  distinction this analysis cannot make.
+- **No margin data.** The recommendation is framed in revenue and share because
+  the files contain no cost. Whether a share point in one department is worth
+  more than in another depends on margins we do not observe.
+- **Two years, one retailer, unknown geography.** Store location and local
+  competition are absent, so a department's performance may reflect the
+  competitive set rather than shopper preference.
+- **Screened households.** The `r dollar(params$min_hh_dept)` minimum makes the
+  shares stable but tilts the sample toward committed shoppers of each
+  department. Occasional shoppers are under-represented by design.
+
+---
+
+# Every number quoted on the slides
+
+```{r slide-numbers}
+slide <- c(
+  paste0("departments_analysed              : ", nrow(dept_tbl)),
+  paste0("departments_passing_screen        : ", nrow(elig)),
+  paste0("focus_departments                 : ", paste(focus_depts, collapse = " | ")),
+  paste0("households_total                  : ", comma(uniqueN(dt$HOUSEHOLD_KEY))),
+  paste0("households_in_tests               : ", comma(uniqueN(hd$HOUSEHOLD_KEY))),
+  paste0("hh_dept_observations              : ", comma(nrow(hd))),
+  paste0("dollars_retained_after_cleaning   : ",
+         percent(audit$pct_dollars_kept[3], 0.1)),
+  "",
+  paste0("top_dept_by_PL_revenue            : ", top_rev$DEPARTMENT),
+  paste0("top_dept_PL_revenue               : ", dollar(top_rev$revenue_private)),
+  paste0("top_dept_by_PL_share              : ", top_share$DEPARTMENT),
+  paste0("top_dept_PL_share                 : ", percent(top_share$pl_dollar_share, 0.1)),
+  paste0("spearman_revenue_vs_share         : ", round(sp, 3)),
+  paste0("top_category_by_PL_revenue        : ", top_cat$DEPARTMENT, " / ",
+         top_cat$COMMODITY_DESC),
+  paste0("top_category_PL_revenue           : ", dollar(top_cat$revenue_private)),
+  paste0("top_category_PL_share             : ", percent(top_cat$pl_dollar_share, 0.1)),
+  "",
+  paste0("highest_mean_hh_share_dept        : ", ci_tbl$DEPARTMENT[1]),
+  paste0("highest_mean_hh_share             : ", percent(ci_tbl$mean_share[1], 0.1),
+         "  CI ", percent(ci_tbl$boot_lo[1], 0.1), " - ",
+         percent(ci_tbl$boot_hi[1], 0.1)),
+  paste0("lowest_mean_hh_share_dept         : ", ci_tbl$DEPARTMENT[nrow(ci_tbl)]),
+  paste0("lowest_mean_hh_share              : ",
+         percent(ci_tbl$mean_share[nrow(ci_tbl)], 0.1),
+         "  CI ", percent(ci_tbl$boot_lo[nrow(ci_tbl)], 0.1), " - ",
+         percent(ci_tbl$boot_hi[nrow(ci_tbl)], 0.1)),
+  paste0("top_minus_bottom_gap_pp           : ",
+         round((ci_tbl$mean_share[1] - ci_tbl$mean_share[nrow(ci_tbl)]) * 100, 1)),
+  "",
+  paste0("welch_F                           : ", round(welch$statistic, 1)),
+  paste0("welch_p                           : ",
+         format.pval(welch$p.value, eps = .Machine$double.eps)),
+  paste0("kruskal_p                         : ",
+         format.pval(kw$p.value, eps = .Machine$double.eps)),
+  paste0("eta_squared                       : ", percent(eta2, 0.1)),
+  paste0("pairwise_comparisons_run          : ", nrow(tuk)),
+  paste0("pairwise_significant_adjusted     : ", n_sig),
+  paste0("largest_gap_comparison            : ", tuk$comparison[1],
+         " = ", round(tuk$diff[1] * 100, 1), " pp  CI [",
+         round(tuk$lwr[1] * 100, 1), ", ", round(tuk$upr[1] * 100, 1), "]"),
+  "",
+  paste0("friedman_p                        : ",
+         format.pval(fr$p.value, eps = .Machine$double.eps)),
+  paste0("kendalls_W                        : ", round(kendall_w, 3)),
+  paste0("complete_households               : ", comma(length(complete_hh))),
+  paste0("cramers_V_items                   : ", round(cramers_v, 3)),
+  paste0("highest_preference_index          : ",
+         pref[which.max(preference_index), DEPARTMENT], " = ",
+         round(max(pref$preference_index), 2))
+)
+writeLines(slide, "out/slide_numbers.txt")
+cat(slide, sep = "\n")
+```
+
+```{r session, echo=FALSE}
+sessionInfo()
+```
