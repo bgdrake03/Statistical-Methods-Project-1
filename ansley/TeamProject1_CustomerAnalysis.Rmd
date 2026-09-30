@@ -1,0 +1,602 @@
+---
+title: "Which Customers Buy Private Label?"
+output: html_notebook
+editor_options:
+  chunk_output_type: inline
+---
+
+**Question:** Which household demographics are associated with buying more private label, and which ones carry no signal?
+
+**Unit of analysis:** one household. Demographics describe households, not baskets, so each household counts once (n = 801 households with demographics).
+
+**Measure of "buys private label":** the share of a household's item lines that are private label, counted only in departments where shoppers actually choose between a private-label and a national-brand product.
+
+
+LOAD DATA
+```{r}
+library(tidyverse)
+
+DEM     <- read.csv("hh_demographic.csv")
+PRODUCT <- read.csv("product.csv")
+TRANS   <- read.csv("transaction_data.csv")
+```
+
+
+CLEAN DATASETS
+```{r}
+
+PROD_BASIC <- PRODUCT |>
+  select(PRODUCT_ID, DEPARTMENT, BRAND)
+
+TRANS_BASIC <- TRANS |>
+  select(household_key, BASKET_ID, PRODUCT_ID, SALES_VALUE, STORE_ID) |>
+  left_join(PROD_BASIC, by = "PRODUCT_ID")
+
+# Private-label rate of every department (all households)
+DEPT_TABLE <- TRANS_BASIC |>
+  group_by(DEPARTMENT) |>
+  summarise(LINES = n(), PL_RATE = mean(BRAND == "Private"), .groups = "drop") |>
+  arrange(desc(LINES))
+
+# Keep departments where private label is a real shelf choice:
+#  - at least 1,000 item lines
+#  - private label is at least 1% of lines (it is actually offered)
+#  - private label is at most 90% of lines (drops KIOSK-GAS = 100% and MISC SALES TRAN = 97%,
+#    where "Private" is fuel or a store transaction code, not a brand choice)
+DEPT_KEEP <- DEPT_TABLE |>
+  filter(LINES >= 1000, PL_RATE >= 0.01, PL_RATE <= 0.90) |>
+  pull(DEPARTMENT)
+
+DEPT_TABLE |>
+  mutate(PL_RATE = round(100 * PL_RATE, 1), KEPT = DEPARTMENT %in% DEPT_KEEP) |>
+  head(20) |>
+  knitr::kable(col.names = c("Department", "Item Lines", "Private Label (%)", "Kept"),
+               caption = "Departments kept for the analysis (top 20 by volume)")
+
+TRANS_KEEP <- TRANS_BASIC |>
+  filter(DEPARTMENT %in% DEPT_KEEP)
+
+# Store environment (used later to test an alternative explanation):
+# the private-label rate of the stores each household shops at, computed from all
+# OTHER households' purchases so a household's own buying does not count toward it
+STORE_TOTALS <- TRANS_KEEP |>
+  group_by(STORE_ID) |>
+  summarise(STORE_LINES = n(), STORE_PL = sum(BRAND == "Private"), .groups = "drop")
+
+HH_STORE_ENV <- TRANS_KEEP |>
+  filter(household_key %in% DEM$household_key) |>
+  group_by(household_key, STORE_ID) |>
+  summarise(HH_LINES = n(), HH_PL = sum(BRAND == "Private"), .groups = "drop") |>
+  left_join(STORE_TOTALS, by = "STORE_ID") |>
+  filter(STORE_LINES > HH_LINES) |>
+  mutate(STORE_RATE_OTHERS = (STORE_PL - HH_PL) / (STORE_LINES - HH_LINES)) |>
+  group_by(household_key) |>
+  summarise(STORE_ENV = weighted.mean(STORE_RATE_OTHERS, HH_LINES), .groups = "drop")
+
+DATA_JOINED <- TRANS_KEEP |>
+  inner_join(DEM, by = "household_key") |>
+  left_join(DEPT_TABLE |> select(DEPARTMENT, DEPT_PL_RATE = PL_RATE), by = "DEPARTMENT")
+
+cat("Item lines kept for demographic households:", nrow(DATA_JOINED), "\n")
+
+rm(TRANS, TRANS_BASIC, TRANS_KEEP, PRODUCT)
+gc()
+```
+
+
+BUILD HOUSEHOLD-LEVEL DATA
+```{r}
+
+HH <- DATA_JOINED |>
+  group_by(household_key) |>
+  summarise(
+    ITEMS            = n(),
+    BASKETS          = n_distinct(BASKET_ID),
+    PL_SHARE         = mean(BRAND == "Private"),                                        # main measure
+    PL_DOLLAR_SHARE  = sum(SALES_VALUE[BRAND == "Private"]) / sum(SALES_VALUE),         # robustness check
+    GROCERY_PL_SHARE = mean(BRAND[DEPARTMENT == "GROCERY"] == "Private"),               # alternative explanation check
+    EXPECTED_MIX     = mean(DEPT_PL_RATE),     # share expected from department mix alone
+    .groups = "drop"
+  ) |>
+  inner_join(DEM, by = "household_key") |>
+  left_join(HH_STORE_ENV, by = "household_key")
+
+# Original income brackets: several are too small to analyze on their own
+HH |>
+  count(INCOME_DESC) |>
+  mutate(INCOME_DESC = factor(INCOME_DESC, levels = c(
+    "Under 15K", "15-24K", "25-34K", "35-49K", "50-74K", "75-99K",
+    "100-124K", "125-149K", "150-174K", "175-199K", "200-249K", "250K+"))) |>
+  arrange(INCOME_DESC) |>
+  knitr::kable(col.names = c("Original Income Bracket", "Households"),
+               caption = "Original income brackets (five have fewer than 40 households)")
+
+# Combine into six brackets, ordered low to high
+HH <- HH |>
+  mutate(INCOME = case_when(
+    INCOME_DESC %in% c("Under 15K", "15-24K")                          ~ "Under 25K",
+    INCOME_DESC %in% c("25-34K", "35-49K")                             ~ "25-49K",
+    INCOME_DESC == "50-74K"                                            ~ "50-74K",
+    INCOME_DESC == "75-99K"                                            ~ "75-99K",
+    INCOME_DESC %in% c("100-124K", "125-149K")                         ~ "100-149K",
+    INCOME_DESC %in% c("150-174K", "175-199K", "200-249K", "250K+")    ~ "150K+"
+  ),
+  INCOME = factor(INCOME, levels = c("Under 25K", "25-49K", "50-74K", "75-99K", "100-149K", "150K+")))
+
+# The seven demographics we compare, with display names
+DEMO_VARS <- c(
+  AGE_DESC            = "Age",
+  MARITAL_STATUS_CODE = "Marital Status",
+  INCOME              = "Income",
+  HOMEOWNER_DESC      = "Homeowner Status",
+  HH_COMP_DESC        = "Household Composition",
+  KID_CATEGORY_DESC   = "Number of Kids",
+  HOUSEHOLD_SIZE_DESC = "Household Size"
+)
+
+# Groups smaller than this are flagged as too small to trust on their own
+SMALL_N <- 30
+
+OVERALL_MEAN <- mean(HH$PL_SHARE)
+```
+
+
+DESCRIPTION: DISTRIBUTION OF HOUSEHOLD PRIVATE-LABEL SHARE
+```{r fig.width=8, fig.height=4}
+
+HH |>
+  summarise(Households = n(),
+            `Median baskets per household` = median(BASKETS),
+            `Mean share (%)`   = round(100 * mean(PL_SHARE), 1),
+            `Median share (%)` = round(100 * median(PL_SHARE), 1),
+            `SD (pts)`         = round(100 * sd(PL_SHARE), 1),
+            `Min (%)`          = round(100 * min(PL_SHARE), 1),
+            `Max (%)`          = round(100 * max(PL_SHARE), 1)) |>
+  knitr::kable(caption = "Household private-label share of items")
+
+ggplot(HH, aes(x = 100 * PL_SHARE)) +
+  geom_histogram(binwidth = 2.5, boundary = 0, fill = "#2a78d6", color = "white") +
+  geom_vline(xintercept = 100 * OVERALL_MEAN, linetype = "dashed", color = "grey30") +
+  labs(title = sprintf("Half of households buy private label for %.0f-%.0f%% of their items",
+                       100 * quantile(HH$PL_SHARE, 0.25), 100 * quantile(HH$PL_SHARE, 0.75)),
+       subtitle = sprintf("801 households; dashed line = mean (%.1f%%)", 100 * OVERALL_MEAN),
+       x = "Private-label share of household's items (%)", y = "Number of households") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.title = element_text(face = "bold"),
+        plot.title.position = "plot")
+```
+
+
+GROUP AVERAGES WITH 95% CONFIDENCE INTERVALS
+```{r}
+
+group_summary <- function(var) {
+  HH |>
+    group_by(GROUP = .data[[var]]) |>
+    summarise(HOUSEHOLDS = n(), MEAN = mean(PL_SHARE), SE = sd(PL_SHARE) / sqrt(n()), .groups = "drop") |>
+    mutate(LOWER       = MEAN - qt(0.975, HOUSEHOLDS - 1) * SE,
+           UPPER       = MEAN + qt(0.975, HOUSEHOLDS - 1) * SE,
+           SMALL_GROUP = HOUSEHOLDS < SMALL_N,
+           VAR         = var,
+           VARIABLE    = DEMO_VARS[[var]],
+           GROUP       = as.character(GROUP))
+}
+
+GROUP_SUMMARY <- map_dfr(names(DEMO_VARS), group_summary)
+
+GROUP_SUMMARY |>
+  transmute(VARIABLE, GROUP, HOUSEHOLDS,
+            MEAN_PCT = round(100 * MEAN, 1),
+            CI_95    = sprintf("%.1f - %.1f", 100 * LOWER, 100 * UPPER),
+            FLAG     = ifelse(SMALL_GROUP, "SMALL GROUP (n < 30)", "")) |>
+  knitr::kable(col.names = c("Demographic", "Group", "Households", "Private Share (%)", "95% CI", "Flag"),
+               caption = "Average household private-label share by demographic group")
+
+# Groups too small to trust on their own
+GROUP_SUMMARY |>
+  filter(SMALL_GROUP) |>
+  select(VARIABLE, GROUP, HOUSEHOLDS)
+```
+
+
+SIGNIFICANCE TESTS: WHICH DEMOGRAPHICS CARRY SIGNAL?
+```{r}
+
+# One test per demographic (7 tests):
+#  - Welch ANOVA: compares group means without assuming equal spread across groups
+#  - Kruskal-Wallis: rank-based check that does not assume a normal distribution
+#  - Eta squared: share of the household-to-household variation the demographic explains
+#  - Holm adjustment: accounts for running 7 tests
+test_one <- function(var) {
+  f <- reformulate(var, response = "PL_SHARE")
+  aov_tab <- anova(lm(f, data = HH))
+  tibble(VAR       = var,
+         VARIABLE  = DEMO_VARS[[var]],
+         GROUPS    = n_distinct(HH[[var]]),
+         ETA_SQ    = aov_tab$`Sum Sq`[1] / sum(aov_tab$`Sum Sq`),
+         P_WELCH   = oneway.test(f, data = HH, var.equal = FALSE)$p.value,
+         P_KRUSKAL = kruskal.test(f, data = HH)$p.value)
+}
+
+# Size of the gap between the highest and lowest group (groups with n >= 30 only)
+SPREAD <- GROUP_SUMMARY |>
+  filter(!SMALL_GROUP) |>
+  group_by(VAR) |>
+  summarise(SPREAD_PTS = 100 * (max(MEAN) - min(MEAN)), .groups = "drop")
+
+TEST_TABLE <- map_dfr(names(DEMO_VARS), test_one) |>
+  mutate(P_WELCH_HOLM   = p.adjust(P_WELCH,   method = "holm"),
+         P_KRUSKAL_HOLM = p.adjust(P_KRUSKAL, method = "holm"),
+         SIGNIFICANT    = P_WELCH_HOLM < 0.05 & P_KRUSKAL_HOLM < 0.05) |>
+  left_join(SPREAD, by = "VAR") |>
+  arrange(P_WELCH)
+
+TEST_TABLE |>
+  transmute(VARIABLE, GROUPS,
+            SPREAD_PTS     = round(SPREAD_PTS, 1),
+            ETA_SQ_PCT     = round(100 * ETA_SQ, 1),
+            P_WELCH_HOLM   = format.pval(P_WELCH_HOLM,   digits = 2, eps = 0.0001),
+            P_KRUSKAL_HOLM = format.pval(P_KRUSKAL_HOLM, digits = 2, eps = 0.0001),
+            SIGNIFICANT) |>
+  knitr::kable(col.names = c("Demographic", "Groups", "Gap High-Low (pts)", "Variation Explained (%)",
+                             "Welch p (Holm)", "Kruskal-Wallis p (Holm)", "Significant"),
+               caption = "Which demographics are associated with private-label share? (7 tests, Holm-adjusted)")
+
+# Pairwise comparisons inside each significant demographic (Holm-adjusted, unequal variances)
+for (var in TEST_TABLE$VAR[TEST_TABLE$SIGNIFICANT]) {
+  cat("\n----", DEMO_VARS[[var]], "- pairwise p-values (Holm) ----\n")
+  print(pairwise.t.test(HH$PL_SHARE, HH[[var]], p.adjust.method = "holm", pool.sd = FALSE)$p.value |>
+          signif(2))
+}
+```
+
+
+CONFIDENCE INTERVAL CHARTS
+```{r fig.width=8, fig.height=4}
+
+ci_chart <- function(var) {
+  d <- GROUP_SUMMARY |>
+    filter(VAR == var) |>
+    mutate(LABEL = ifelse(SMALL_GROUP,
+                          sprintf("%s (n=%d, small)", GROUP, HOUSEHOLDS),
+                          sprintf("%s (n=%d)", GROUP, HOUSEHOLDS)),
+           LABEL = factor(LABEL, levels = rev(LABEL)))
+  p_holm <- TEST_TABLE$P_WELCH_HOLM[TEST_TABLE$VAR == var]
+
+  ggplot(d, aes(x = 100 * MEAN, y = LABEL, color = SMALL_GROUP)) +
+    geom_vline(xintercept = 100 * OVERALL_MEAN, linetype = "dashed", color = "grey50") +
+    geom_errorbar(aes(xmin = 100 * LOWER, xmax = 100 * UPPER), width = 0.25, linewidth = 0.8) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c(`FALSE` = "#2a78d6", `TRUE` = "grey60"), guide = "none") +
+    coord_cartesian(xlim = c(10, 40)) +
+    labs(title    = paste("Private-Label Share by", DEMO_VARS[[var]]),
+         subtitle = sprintf("Household mean with 95%% CI  |  Holm-adjusted p = %s  |  dashed line = all households (%.1f%%)",
+                            format.pval(p_holm, digits = 2, eps = 0.0001), 100 * OVERALL_MEAN),
+         caption  = if (any(d$SMALL_GROUP)) "Grey = fewer than 30 households; interpret with caution" else NULL,
+         x = "Private-label share of household's items (%)", y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"), plot.title.position = "plot")
+}
+
+for (var in TEST_TABLE$VAR) print(ci_chart(var))   # most to least significant
+```
+
+
+DO THE SIGNALS HOLD UP TOGETHER? (MULTIPLE REGRESSION)
+```{r}
+
+# All seven demographics in one model. Each F-test asks: does this demographic still
+# matter after accounting for the other six? This catches demographics that only look
+# important because they overlap with another one (for example marital status and income).
+FULL_MODEL <- lm(reformulate(names(DEMO_VARS), response = "PL_SHARE"), data = HH)
+
+FULL_DROP1 <- drop1(FULL_MODEL, test = "F") |>
+  as.data.frame() |>
+  rownames_to_column("VAR") |>
+  filter(VAR != "<none>") |>
+  transmute(VAR, VARIABLE = DEMO_VARS[VAR], F_VALUE = round(`F value`, 2), P_ADJUSTED_FOR_OTHERS = `Pr(>F)`) |>
+  arrange(P_ADJUSTED_FOR_OTHERS)
+
+FULL_DROP1 |>
+  mutate(P_ADJUSTED_FOR_OTHERS = format.pval(P_ADJUSTED_FOR_OTHERS, digits = 2, eps = 0.0001)) |>
+  select(-VAR) |>
+  knitr::kable(col.names = c("Demographic", "F", "p (controlling for the other six)"),
+               caption = sprintf("Full model: R-squared = %.3f, adjusted R-squared = %.3f",
+                                 summary(FULL_MODEL)$r.squared, summary(FULL_MODEL)$adj.r.squared))
+
+# Statistically significant attributes = significant on their own (Holm-adjusted)
+# AND still significant after controlling for the other demographics
+SIG_VARS <- intersect(TEST_TABLE$VAR[TEST_TABLE$SIGNIFICANT],
+                      FULL_DROP1$VAR[FULL_DROP1$P_ADJUSTED_FOR_OTHERS < 0.05])
+SIG_VARS
+```
+
+
+ALTERNATIVE EXPLANATIONS
+```{r}
+
+# Is the income gap just (a) which departments high-income households shop, or
+# (b) which stores they shop at? Add each as a control and see if the gap survives.
+TOP_INCOME <- paste0("INCOME", last(levels(HH$INCOME)))
+
+gap_row <- function(model, label) {
+  ci <- confint(model)[TOP_INCOME, ]
+  tibble(MODEL        = label,
+         GAP_150K_PTS = round(100 * coef(model)[[TOP_INCOME]], 1),
+         CI_95        = sprintf("%.1f to %.1f", 100 * ci[1], 100 * ci[2]),
+         P_INCOME     = format.pval(drop1(model, test = "F")["INCOME", "Pr(>F)"], digits = 2, eps = 0.0001))
+}
+
+sig_formula <- function(response, controls = NULL) reformulate(c(SIG_VARS, controls), response = response)
+
+ALT_TABLE <- bind_rows(
+  gap_row(lm(sig_formula("PL_SHARE"), HH),                                      "Significant demographics only"),
+  gap_row(lm(sig_formula("PL_SHARE", "EXPECTED_MIX"), HH),                      "+ department mix"),
+  gap_row(lm(sig_formula("PL_SHARE", "STORE_ENV"), HH),                         "+ store environment"),
+  gap_row(lm(sig_formula("PL_SHARE", c("EXPECTED_MIX", "STORE_ENV")), HH),      "+ department mix + store environment"),
+  gap_row(lm(sig_formula("GROCERY_PL_SHARE"), HH),                              "Grocery department only"),
+  gap_row(lm(sig_formula("GROCERY_PL_SHARE", "STORE_ENV"), HH),                 "Grocery only + store environment")
+)
+
+ALT_TABLE |>
+  knitr::kable(col.names = c("Model", "150K+ vs Under 25K (pts)", "95% CI", "Income p-value"),
+               caption = "Does the income gap survive controls for department mix and store?")
+
+# What the controls look like by income group
+HH |>
+  group_by(INCOME) |>
+  summarise(HOUSEHOLDS      = n(),
+            PL_SHARE        = round(100 * mean(PL_SHARE), 1),
+            EXPECTED_MIX    = round(100 * mean(EXPECTED_MIX), 1),
+            STORE_ENV       = round(100 * mean(STORE_ENV), 1),
+            GROCERY_SHARE   = round(100 * mean(GROCERY_PL_SHARE), 1)) |>
+  knitr::kable(col.names = c("Income", "Households", "Actual PL Share (%)",
+                             "Expected from Dept Mix (%)", "Store PL Rate (%)", "Grocery PL Share (%)"),
+               caption = "Income groups: actual share vs. what department mix and store would predict")
+```
+
+
+ASSUMPTION CHECKS AND ROBUSTNESS
+```{r fig.width=8, fig.height=4}
+
+SIG_MODEL <- lm(sig_formula("PL_SHARE"), data = HH)
+
+# 1. Residuals: roughly normal? (With 801 households, averages are reliable even with mild skew)
+qqnorm(resid(SIG_MODEL), main = "Normal Q-Q plot of model residuals"); qqline(resid(SIG_MODEL))
+
+# 2. Equal spread across groups? (Welch ANOVA does not require it, which is why we use it)
+GROUP_SPREAD <- map_dfr(names(DEMO_VARS), function(var) {
+  s <- HH |> group_by(.data[[var]]) |> summarise(SD = sd(PL_SHARE), N = n(), .groups = "drop") |> filter(N >= SMALL_N)
+  tibble(VARIABLE = DEMO_VARS[[var]], LARGEST_SD_OVER_SMALLEST = round(max(s$SD) / min(s$SD), 2))
+})
+GROUP_SPREAD
+
+# 3. Different definition of "buys private label": share of DOLLARS instead of items
+DOLLAR_TESTS <- map_dfr(names(DEMO_VARS), function(var) {
+  tibble(VARIABLE = DEMO_VARS[[var]],
+         P_WELCH  = oneway.test(reformulate(var, response = "PL_DOLLAR_SHARE"), data = HH)$p.value)
+}) |>
+  mutate(P_HOLM = p.adjust(P_WELCH, method = "holm"),
+         SIGNIFICANT_DOLLARS = P_HOLM < 0.05) |>
+  left_join(TEST_TABLE |> select(VARIABLE, SIGNIFICANT_ITEMS = SIGNIFICANT), by = "VARIABLE")
+
+DOLLAR_TESTS |>
+  mutate(P_HOLM = format.pval(P_HOLM, digits = 2, eps = 0.0001)) |>
+  select(VARIABLE, P_HOLM, SIGNIFICANT_DOLLARS, SIGNIFICANT_ITEMS) |>
+  knitr::kable(col.names = c("Demographic", "Welch p (Holm), dollar share", "Significant (dollars)", "Significant (items)"),
+               caption = "Robustness: same conclusions using share of dollars instead of share of items?")
+```
+
+
+WHO ARE THE "UNKNOWN" HOUSEHOLDS?
+```{r}
+
+# 233 households did not report homeowner status, and they buy more private label than homeowners.
+# Are they households that shared less information overall, and what do they look like?
+UNKNOWN_PROFILE <- HH |>
+  mutate(KNOWN = ifelse(HOMEOWNER_DESC == "Unknown", "Unknown homeowner status", "Known homeowner status")) |>
+  group_by(KNOWN) |>
+  summarise(HOUSEHOLDS         = n(),
+            MARITAL_ALSO_UNK   = round(100 * mean(MARITAL_STATUS_CODE == "U"), 0),
+            SINGLE_PERSON      = round(100 * mean(HOUSEHOLD_SIZE_DESC == "1"), 0),
+            UNDER_35           = round(100 * mean(AGE_DESC %in% c("19-24", "25-34")), 0),
+            INCOME_UNDER_50K   = round(100 * mean(INCOME %in% c("Under 25K", "25-49K")), 0),
+            MEDIAN_BASKETS     = median(BASKETS),
+            PL_SHARE           = round(100 * mean(PL_SHARE), 1),
+            .groups = "drop")
+
+UNKNOWN_PROFILE |>
+  knitr::kable(col.names = c("Group", "Households", "Marital Also Unknown (%)", "Single-Person (%)",
+                             "Under Age 35 (%)", "Income Under $50K (%)", "Median Baskets", "PL Share (%)"),
+               caption = "Profile of households that did not report homeowner status")
+
+# Does their higher private-label share survive controls for income, age, size, and trip count?
+UNKNOWN_MODEL <- lm(PL_SHARE ~ I(HOMEOWNER_DESC == "Unknown") + INCOME + AGE_DESC + HOUSEHOLD_SIZE_DESC + log(BASKETS),
+                    data = HH)
+UNKNOWN_COEF <- summary(UNKNOWN_MODEL)$coefficients[2, ]
+UNKNOWN_CI   <- confint(UNKNOWN_MODEL)[2, ]
+
+cat(sprintf("Unknown vs known homeowner status, controlling for income, age, household size, and trips: %+.1f pts (95%% CI %+.1f to %+.1f), p = %.4f\n",
+            100 * UNKNOWN_COEF[["Estimate"]], 100 * UNKNOWN_CI[1], 100 * UNKNOWN_CI[2], UNKNOWN_COEF[["Pr(>|t|)"]]))
+```
+
+
+THE "IDEAL" PRIVATE-LABEL HOUSEHOLD
+```{r fig.width=8, fig.height=6}
+
+# Model using ONLY the statistically significant attributes
+IDEAL_MODEL <- lm(sig_formula("PL_SHARE"), data = HH)
+
+# Predict every combination of those attributes that exists in the data.
+# "Unknown" is missing information, not a customer trait, so it is left out of the ranking.
+IDEAL_GRID <- HH |>
+  count(across(all_of(SIG_VARS)), name = "HOUSEHOLDS") |>
+  filter(if_all(all_of(SIG_VARS), ~ as.character(.x) != "Unknown"))
+
+IDEAL_PRED <- predict(IDEAL_MODEL, newdata = IDEAL_GRID, interval = "confidence")
+
+IDEAL_GRID <- IDEAL_GRID |>
+  mutate(PREDICTED = 100 * IDEAL_PRED[, "fit"],
+         LOWER     = 100 * IDEAL_PRED[, "lwr"],
+         UPPER     = 100 * IDEAL_PRED[, "upr"],
+         SMALL_GROUP = HOUSEHOLDS < SMALL_N,
+         PROFILE   = do.call(paste, c(across(all_of(SIG_VARS), as.character), sep = " / "))) |>
+  arrange(desc(PREDICTED))
+
+IDEAL_GRID |>
+  transmute(PROFILE, HOUSEHOLDS,
+            PREDICTED = round(PREDICTED, 1),
+            CI_95 = sprintf("%.1f - %.1f", LOWER, UPPER),
+            FLAG  = ifelse(SMALL_GROUP, "SMALL GROUP (n < 30)", "")) |>
+  knitr::kable(col.names = c("Profile", "Households Like This", "Predicted PL Share (%)", "95% CI", "Flag"),
+               caption = sprintf("Predicted private-label share from significant attributes only (%s); overall average = %.1f%%",
+                                 paste(DEMO_VARS[SIG_VARS], collapse = " + "), 100 * OVERALL_MEAN))
+
+IDEAL        <- IDEAL_GRID |> slice(1)
+IDEAL_BACKED <- IDEAL_GRID |> filter(!SMALL_GROUP) |> slice(1)
+LEAST        <- IDEAL_GRID |> filter(!SMALL_GROUP) |> slice_tail(n = 1)
+
+cat(sprintf("Ideal private-label household: %s -> %.1f%% predicted (95%% CI %.1f-%.1f), %d households in data%s\n",
+            IDEAL$PROFILE, IDEAL$PREDICTED, IDEAL$LOWER, IDEAL$UPPER, IDEAL$HOUSEHOLDS,
+            ifelse(IDEAL$SMALL_GROUP, " [SMALL GROUP]", "")))
+cat(sprintf("Best profile with 30+ households: %s -> %.1f%% (95%% CI %.1f-%.1f), %d households\n",
+            IDEAL_BACKED$PROFILE, IDEAL_BACKED$PREDICTED, IDEAL_BACKED$LOWER, IDEAL_BACKED$UPPER, IDEAL_BACKED$HOUSEHOLDS))
+cat(sprintf("Lowest profile with 30+ households: %s -> %.1f%% (95%% CI %.1f-%.1f), %d households\n",
+            LEAST$PROFILE, LEAST$PREDICTED, LEAST$LOWER, LEAST$UPPER, LEAST$HOUSEHOLDS))
+
+IDEAL_GRID |>
+  mutate(LABEL = sprintf("%s (n=%d%s)", PROFILE, HOUSEHOLDS, ifelse(SMALL_GROUP, ", small", "")),
+         LABEL = factor(LABEL, levels = rev(LABEL))) |>
+  ggplot(aes(x = PREDICTED, y = LABEL, color = SMALL_GROUP)) +
+  geom_vline(xintercept = 100 * OVERALL_MEAN, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(xmin = LOWER, xmax = UPPER), width = 0.3, linewidth = 0.7) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c(`FALSE` = "#2a78d6", `TRUE` = "grey60"), guide = "none") +
+  labs(title    = "Predicted Private-Label Share by Customer Profile",
+       subtitle = sprintf("Model uses %s only  |  95%% CI  |  dashed line = all households (%.1f%%)",
+                          paste(DEMO_VARS[SIG_VARS], collapse = " + "), 100 * OVERALL_MEAN),
+       caption  = "Grey = fewer than 30 households with this exact profile; estimate borrows from the whole sample",
+       x = "Predicted private-label share of items (%)", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"), plot.title.position = "plot")
+```
+
+
+SLIDE FIGURES
+```{r}
+
+# Charts used on the slides, saved to slide_figures/ at their on-slide size
+# (inches = slide pixels / 100, 300 dpi) so text stays readable when projected
+dir.create("slide_figures", showWarnings = FALSE)
+
+BLUE       <- "#2a78d6"
+LIGHT_BLUE <- "#9cc3ee"
+GREY       <- "#c3cad4"
+ACCENT     <- "#e8833a"
+INK        <- "#1b2430"
+MUTED      <- "#5b6675"
+
+slide_theme <- theme_minimal(base_size = 17) +
+  theme(panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.text          = element_text(color = MUTED),
+        axis.title         = element_text(color = INK),
+        legend.position    = "top",
+        legend.justification = "left",
+        legend.location    = "plot",
+        legend.title       = element_blank(),
+        legend.text        = element_text(color = INK, size = rel(0.8)),
+        plot.background    = element_rect(fill = "white", color = NA))
+
+p_label <- function(p) ifelse(p < 0.001, "p < 0.001", ifelse(p < 0.01, sprintf("p = %.3f", p), sprintf("p = %.2f", p)))
+
+# 1. Distribution of household private-label share
+FIG_DIST <- ggplot(HH, aes(x = 100 * PL_SHARE)) +
+  geom_histogram(binwidth = 2.5, boundary = 0, fill = BLUE, color = "white") +
+  geom_vline(xintercept = 100 * OVERALL_MEAN, linetype = "dashed", color = INK) +
+  annotate("text", x = 100 * OVERALL_MEAN + 1, y = Inf, vjust = 1.4, hjust = 0, size = 5, color = INK,
+           label = sprintf("Average household: %.1f%%", 100 * OVERALL_MEAN)) +
+  scale_x_continuous(breaks = seq(0, 70, 10), labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(x = "Store-brand share of household's items", y = "Households") +
+  slide_theme +
+  theme(panel.grid.major.y = element_line(color = "grey92"), panel.grid.major.x = element_blank())
+
+ggsave("slide_figures/fig1_distribution.png", FIG_DIST, width = 7.7, height = 2.26, dpi = 300)
+
+# 2. Which demographics carry signal
+SIGNAL <- TEST_TABLE |> 
+  mutate(STATUS = case_when(
+           VAR %in% SIG_VARS ~ "Significant (with controls)",
+           SIGNIFICANT       ~ "Significant alone",
+           TRUE              ~ "Not significant"),
+         STATUS = factor(STATUS, levels = c("Significant (with controls)",
+                                            "Significant alone",
+                                            "Not significant")),
+         LABEL    = sprintf("%.1f-pt gap  |  %s", SPREAD_PTS, p_label(P_WELCH_HOLM)),
+         VARIABLE = fct_reorder(VARIABLE, ETA_SQ))
+
+FIG_SIGNAL <- ggplot(SIGNAL, aes(x = 100 * ETA_SQ, y = VARIABLE, fill = STATUS)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = LABEL), hjust = -0.05, size = 4.8, color = INK) +
+  scale_fill_manual(values = c(BLUE, LIGHT_BLUE, GREY), drop = FALSE) +
+  scale_x_continuous(limits = c(0, 10), breaks = seq(0, 10, 2), expand = c(0, 0),
+                     labels = function(x) paste0(x, "%")) +
+  labs(x = "Share of household-to-household variation explained", y = NULL) +
+  slide_theme
+
+ggsave("slide_figures/fig2_signal.png", FIG_SIGNAL, width = 8.84, height = 3.2, dpi = 300)
+
+# 3. Income: household mean with 95% CI, top bracket highlighted
+INCOME_FIG_DATA <- GROUP_SUMMARY |> 
+  filter(VAR == "INCOME") |> 
+  mutate(TOP   = GROUP == last(levels(HH$INCOME)),
+         LABEL = sprintf("%s  (n=%d)", GROUP, HOUSEHOLDS),
+         LABEL = factor(LABEL, levels = rev(LABEL)))
+
+FIG_INCOME <- ggplot(INCOME_FIG_DATA, aes(x = 100 * MEAN, y = LABEL, color = TOP)) +
+  geom_vline(xintercept = 100 * OVERALL_MEAN, linetype = "dashed", color = "grey55") +
+  annotate("text", x = 100 * OVERALL_MEAN + 0.3, y = nrow(INCOME_FIG_DATA) + 0.75, hjust = 0, size = 4.6, color = MUTED,
+           label = sprintf("All households %.1f%%", 100 * OVERALL_MEAN)) +
+  geom_errorbar(aes(xmin = 100 * LOWER, xmax = 100 * UPPER), width = 0.3, linewidth = 1.1) +
+  geom_point(size = 4.5) +
+  geom_text(aes(x = 35.5, label = sprintf("%.1f%%", 100 * MEAN)), hjust = 1, size = 5.2, fontface = "bold") +
+  scale_color_manual(values = c(`FALSE` = BLUE, `TRUE` = ACCENT), guide = "none") +
+  scale_y_discrete(expand = expansion(add = c(0.6, 1.1))) +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  coord_cartesian(xlim = c(15, 35.5)) +
+  labs(x = "Store-brand share of items (household average, 95% CI)", y = NULL) +
+  slide_theme
+
+ggsave("slide_figures/fig3_income.png", FIG_INCOME, width = 8.4, height = 4.44, dpi = 300)
+
+# 4. Does the 150K+ gap survive the alternative explanations?
+gap_estimate <- function(model, label) {
+  ci <- confint(model)[TOP_INCOME, ]
+  tibble(MODEL = label, EST = 100 * coef(model)[[TOP_INCOME]], LO = 100 * ci[1], HI = 100 * ci[2])
+}
+
+GAP_FIG_DATA <- bind_rows(
+  gap_estimate(lm(sig_formula("PL_SHARE"), HH),                                 "Income + homeowner only"),
+  gap_estimate(lm(sig_formula("PL_SHARE", "EXPECTED_MIX"), HH),                 "+ department mix"),
+  gap_estimate(lm(sig_formula("PL_SHARE", "STORE_ENV"), HH),                    "+ store environment"),
+  gap_estimate(lm(sig_formula("PL_SHARE", c("EXPECTED_MIX", "STORE_ENV")), HH), "+ both"),
+  gap_estimate(lm(sig_formula("GROCERY_PL_SHARE"), HH),                         "Grocery aisle only")
+) |> 
+  mutate(MODEL = factor(MODEL, levels = rev(MODEL)))
+
+FIG_GAP <- ggplot(GAP_FIG_DATA, aes(x = EST, y = MODEL)) +
+  geom_vline(xintercept = 0, color = "grey55") +
+  geom_errorbar(aes(xmin = LO, xmax = HI), width = 0.3, linewidth = 1, color = ACCENT) +
+  geom_point(size = 4, color = ACCENT) +
+  geom_text(aes(x = HI, label = sprintf("%.1f", EST)), hjust = -0.35, size = 4.8, fontface = "bold", color = INK) +
+  scale_x_continuous(limits = c(-15, 1.5), breaks = seq(-15, 0, 5)) +
+  labs(x = "$150K+ vs. under-$25K gap (points, 95% CI)", y = NULL) +
+  slide_theme
+
+ggsave("slide_figures/fig4_gap_checks.png", FIG_GAP, width = 7.8, height = 3.3, dpi = 300)
+
+GAP_FIG_DATA
+```
